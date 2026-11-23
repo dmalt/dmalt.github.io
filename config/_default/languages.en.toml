@@ -12,18 +12,20 @@ title = "Blowfish"
 
 [params.author]
   name = "Dmitrii Altukhov"
-  headline = "Stupor mozgoviny"
-  bio = "Ходил и пил"
+  # headline = "Stupor mozgoviny"
+  # bio = ""
   image = "profile.jpg"
   # logo = "img/logo.png"
   # secondaryLogo = "img/secondary-logo.png"
   description = "My awesome website"
   copyright = "Copy, _right?_ :thinking_face:"
   links = [
-    { email = "mailto:hello@your_domain.com" },
-    { link = "https://link-to-some-website.com/" },
-    { amazon = "https://www.amazon.com/hz/wishlist/ls/wishlist-id" },
-    { apple = "https://www.apple.com" },
+    # { email = "mailto:hello@your_domain.com" },
+    # { link = "https://link-to-some-website.com/" },
+    # { amazon = "https://www.amazon.com/hz/wishlist/ls/wishlist-id" },
+    # { apple = "https://www.apple.com" },
+    { linkedin = "https://linkedin.com/in/dmitrii-altukhov-258b05233" },
+    { github = "https://github.com/dmalt" },
   ]
 
 # [params.author]
