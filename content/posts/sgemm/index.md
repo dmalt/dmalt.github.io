@@ -988,7 +988,6 @@ responsible for 88.88% of the total excessive wavefronts (the remaining 11.11% i
 attributed to the line `regTM[iTM] = As[(iTM + tRow * TM) * BK + iDot];`, but
 let's focus on `Bs` - the reasoning is similar.)
 
-
 To figure out what's conflicting we need to see what indices a single warp
 produces, modulo the number of banks (32). Let's say `iDot` and `iTN` are 0.
 With `TN=8` we have `(tCol * TN) % 32 = 8 * (tCol % 4)`,
@@ -1107,47 +1106,70 @@ So, since the MIO throttle is still the main issue, the bank conflicts look
 like an obvious next target to tackle it.
 
 But first, let's napkin-math the number of shared-load wavefronts and see if we
-can arrive at the measured 671088640. I'll count per warp per K-tile and
-multiply by the number of warps and K-tiles at the end. Recall that with 256
+can arrive at the measured 671088640. I'll count per warp per K-step (one
+iteration of the outer `bkIdx` loop, `K / BK = 512` of them) and multiply by
+the number of warps and K-steps at the end. Within one K-step, the inner loop
+below runs `iDot` over `BK = 8` values. Recall that with 256
 threads per block, `tRow = threadIdx.x / 16` and `tCol = threadIdx.x % 16`, so
 a warp holds two values of `tRow`, each with `tCol` running from 0 to 15.
 
+```cpp
+for (int iDot = 0; iDot < BK; ++iDot) {
+  for (int iTM = 0; iTM < TM; ++iTM) {
+    regTM[iTM] = As[iDot * BM + tRow * TM + iTM];
+    }
+  for (int iTN = 0; iTN < TN; ++iTN) {
+    regTN[iTN] = Bs[iDot * BN + iTN + tCol * TN];
+  }
+  // ... }
+```
+
 First, for `regTM[iTM] = As[iDot * BM + tRow * TM + iTM];`. Each thread loads
-`TM = 8` floats per `iDot` with 2 `LDS.128` instructions, so it's 16 instructions
-per K-tile (`BK = 8` iterations of iDot). Within one instruction, the 16 lanes of
-one `tRow` all read the same `float4` (a broadcast), and the other 16 lanes
-read another `float4` 8 floats further. That's 8 different floats in 8
-different banks, so one wavefront should be enough. But we saw in k25 that a
-broadcast `LDS.128` resolvs into 2 wavefronts (the reason being unclear), so
-let's assume 2 here as well. That's `16 * 2 = 32` wavefronts per warp per
-K-tile.
+`TM = 8` floats per `iDot` with 2 `LDS.128` instructions (`2 x float4`), so
+it's `8 * 2 = 16` instructions per K-step. Within one
+instruction, the 16 lanes of one `tRow` all read the same `float4` (a
+broadcast), and the other 16 lanes read another `float4` 8 floats further.
+That's 8 different floats in 8 different banks per one issued `LDS.U.128`, so
+one wavefront should be enough. But we saw in k25 that a broadcast `LDS.128`
+resolves into 2 wavefronts (the reason being unclear, but others also report
+it, see [here](https://feldmann.nyc/blog/smem-microbenchmarks) and
+[here](https://stackoverflow.com/questions/79972685/how-to-calculate-wavefronts-when-broadcasting)),
+so let's assume it takes 2 wavefronts as well. That's `16 * 2 = 32` wavefronts
+per warp per K-step.
 
 Now, for `regTN[iTN] = Bs[iDot * BN + iTN + tCol * TN];` we again have 16
-`LDS.128` instructions per K-tile, but they are not broadcasts: `tCol` is the
+`LDS.U.128` instructions per K-step, but they are not broadcasts: `tCol` is the
 fast index, so the 16 values of `tCol` ask for 16 different `float4`s (the second
 `tRow` asks for the same ones). We saw for k27 that for a fixed `iTN` this index
-taps into only 4 different banks. A wide load covers 4 consecutive `iTN`, so
-each instruction uses 16 banks, with 4 different floats in each:
+taps into only 4 different banks. A wide load reads 4 consecutive `iTN` at once,
+so each of those 4 banks widens into a group of 4 neighbouring banks, 16 banks in
+total. We ask each of these banks for 4 different floats, one for each of the 4
+`tCol`s that land in it:
 
 ```
-bank     0-3   4-7   8-11  12-15  16-19  20-23  24-27  28-31
-tCol     0     -     1     -      2      -      3      -
-         4     -     5     -      6      -      7      -
-         8     -     9     -      10     -      11     -
-         12    -     13    -      14     -      15     -
+banks 0-3 <- tCol 0, 4, 8, 12
+banks 8-11 <- tCol 1, 5, 9, 13
+banks 16-19 <- tCol 2, 6, 10, 14
+banks 24-27 <- tCol 3, 7, 11, 15
+banks 4-7, 12-15, 20-23, 28-31: unused (they hold iTN 4-7, read by the second LDS.128)
 ```
 
-A bank delivers one float per wavefront, so it takes at least 4 wavefronts per
-instruction. On top of that come the bank conflicts: NCU reports 268435456 of
-them for the shared loads, all on the `Bs` line. Spread over
-`16 * 512 * 8192` `Bs` instructions, that's 4 extra wavefronts per instruction,
-so 8 in total, and `16 * 8 = 128` wavefronts per warp per K-tile.
+A bank delivers one float per wavefront, so this 4-way conflict alone means at
+least 4 wavefronts per instruction. For `As`, `LDS.U.128` cost twice the bank
+minimum (2 instead of 1), so let's assume the same here: 8 wavefronts per
+instruction, and `16 * 8 = 128` wavefronts per warp per K-step. Blog
+[post](https://feldmann.nyc/blog/smem-microbenchmarks) already mentioned a few
+paragraphs above reports both effects, albeit on a different GPU:
 
-In total, we get 32 + 128 = 160 wavefronts per warp per K-tile. With
-4096² / 64 / 32 = 8192 warps and K / BK = 512 K-tiles that's
-160 × 512 × 8192 = 671088640, exactly the measured number, which also confirms
-the 2 wavefronts per `As` instruction. The 268435456 conflict wavefronts are
-what we're going after next.
+- when accessing the same item from different lanes in a warp a multicast takes place
+- broadcasts with 128-bit wide loads result in a 2x slowdown
+
+In total, we get 32 + 128 = 160 wavefronts per warp per K-step. With
+4096^2 / 64 / 32 = 8192 warps and K / BK = 512 K-steps that's
+160 x 512 x 8192 = 671088640 -- exactly the measured number, which confirms both
+assumptions. NCU counts 4 of the 8 `Bs` wavefronts per instruction as bank
+conflicts: `4 * 16 * 512 * 8192 = 268435456`, exactly the reported number of
+shared-load bank conflicts. Those are what we're going after next.
 
 One important observation from this math: a wavefront reads at most 32 floats,
 one per bank. So when a warp needs 32 different floats from 32 different banks,
@@ -1181,25 +1203,28 @@ completely:
 | Other              | ... | 0 (+0%)              |
 | **Total**          | ... | 33554432 (-88.24%)   |
 
-At the same time, the Shared Store conflicts are up by 100%. Shared storeas are not
+At the same time, the Shared Store conflicts are up by 100%. Shared stores are not
 the problem however: those are the minority (total is down by 88%) and we're no longer
 bottlenecked by the shared memory (MIO is not the top warp stall).
 
 For curiosity let's look at "L1 Wavefronts Shared Excessive" metric to see
-where the store load conflicts orignate from:
+where the shared store conflicts originate from:
 
 ![k29 bank conflicts](assets/k29_bank_conflicts_per_line.png)
- 
+
 We see that they are now equally split between the lines loading `As` and `Bs`
 into the shared memory.
 
 The number of Shared Memory Load requests is up by 150% to 335544320, but
-the wavefronts number is actually down by 40%: 402653184. Let's again napkin-math it.
+the wavefronts number is actually down by 40%: 402653184 vs 6. Let's again napkin-math it.
 
-
-
-
-
+  <!-- 1. Show the change first. Put k29's Bs read index next to k28's, and its store index too if you like. Without that, the reader can't follow why the banks change. -->
+  <!-- 2. As: unchanged from k28, 16 × 2 = 32 wavefronts per warp per K-step. -->
+  <!-- 3. Bs: 8 scalar LDS per iDot, so 64 per K-step. In one instruction the 16 tCols read 16 consecutive floats, which sit in 16 different banks. The second tRow reads the same ones -->
+  <!--    and gets them by broadcast. So each instruction is 1 wavefront, 64 per K-step. -->
+  <!-- 4. Total: 32 + 64 = 96 per warp per K-step, and 96 × 512 × 8192 = 402,653,184, which matches the measurement. -->
+  <!-- 5. Pay off "we'll come back to it" from k27. The 4-bank pattern there becomes 16 consecutive banks here. If you want, add a bank map in the same format as the k28 one; it would -->
+  <!--    be one row. -->
 
 - The ultimate limit we should hit for an optimal kernel is the FMA pipeline.
   For k29 it's at 74.42% utilization, suggesting another 25% duration cut should
@@ -1243,3 +1268,7 @@ the wavefronts number is actually down by 40%: 402653184. Let's again napkin-mat
 ## References
 
 [Nvidia ref](https://developer.nvidia.com/blog/analysis-driven-optimization-preparing-for-analysis-with-nvidia-nsight-compute-part-1/)
+
+```
+
+```
